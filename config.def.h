@@ -119,9 +119,6 @@ char *termname = "st-256color";
  */
 unsigned int tabspaces = 4;
 
-/* bg opacity */
-float alpha = 1.0;
-
 /*
  * drag and drop escape characters
  *
@@ -256,8 +253,6 @@ static MouseShortcut mshortcuts[] = {
 	{ XK_ANY_MOD,           Button5, ttysend,        {.s = "\005"} },
 };
 
-static const char *writetofilecmd[] = {"/bin/sh", "-c", "cat > $(mktemp /tmp/st-screen.XXXXXX)"};
-
 static Shortcut shortcuts[] = {
 	/* mask                 keysym          function        argument */
 	{ XK_ANY_MOD,           XK_Break,       sendbreak,      {.i =  0} },
@@ -278,7 +273,6 @@ static Shortcut shortcuts[] = {
 	{ TERMMOD,              XK_F6,          dumpgrstate,    {.i =  0} },
 	{ TERMMOD,              XK_F7,          unloadimages,   {.i =  0} },
 	{ TERMMOD,              XK_F8,          toggleimages,   {.i =  0} },
-	{ TERMMOD,              XK_F9,          externalpipe,   { .v = writetofilecmd } },
 };
 
 /*
