@@ -215,9 +215,9 @@ if [ -z "$cols" ] || [ -z "$rows" ]; then
     # If it didn't work, try to use csi XTWINOPS.
     if [ -z "$cell_width" ] || [ -z "$cell_height" ]; then
         if [ -n "$inside_tmux" ]; then
-            printf '\ePtmux;\e\e[16t\e\\' >> "$command_tty"
+            printf '\033Ptmux;\033\033[16t\033\\' >> "$command_tty"
         else
-            printf '\e[16t' >> "$command_tty"
+            printf '\033[16t' >> "$command_tty"
         fi
         # The expected response will look like ^[[6;<height>;<width>t
         term_response=""
@@ -293,11 +293,24 @@ fi
 
 image_id=""
 while [ -z "$image_id" ]; do
-    image_id="$(shuf -i 16777217-4294967295 -n 1)"
-    # Check that the id requires 24-bit fg colors.
-    if [ "$(expr \( "$image_id" / 256 \) % 65536)" -eq 0 ]; then
-        image_id=""
+    # Read 4 bytes from /dev/urandom, convert them to decimal numbers and assign
+    # them to b1, b2, b3, b4.
+    set -- $(od -A n -t u1 -N 4 -v /dev/urandom 2>/dev/null)
+    if [ $# -lt 4 ]; then
+        echo "Failed to read from /dev/urandom" >&2
+        exit 1
     fi
+    b1=$1 b2=$2 b3=$3 b4=$4
+
+    # Require the MSB and one of the middle bytes to be non-zero.
+    if [ "$b1" -eq 0 ]; then
+        continue
+    elif [ "$b2" -eq 0 ] && [ "$b3" -eq 0 ]; then
+        continue
+    fi
+
+    # Build a 32-bit number.
+    image_id=$(expr \( \( "$b1" \* 256 + "$b2" \) \* 256 + "$b3" \) \* 256 + "$b4")
 done
 
 #####################################################################
@@ -316,11 +329,11 @@ fi
 # Functions to emit the start and the end of a graphics command.
 if [ -n "$inside_tmux" ]; then
     # If we are in tmux we have to wrap the command in Ptmux.
-    graphics_command_start='\ePtmux;\e\e_G'
-    graphics_command_end='\e\e\\\e\\'
+    graphics_command_start='\033Ptmux;\033\033_G'
+    graphics_command_end='\033\033\\\033\\'
 else
-    graphics_command_start='\e_G'
-    graphics_command_end='\e\\'
+    graphics_command_start='\033_G'
+    graphics_command_end='\033\\'
 fi
 
 # Send a graphics command with the correct start and end
@@ -535,14 +548,14 @@ print_placeholder() {
     blue="$(expr "$image_id" % 256 )"
     green="$(expr \( "$image_id" / 256 \) % 256 )"
     red="$(expr \( "$image_id" / 65536 \) % 256 )"
-    line_start="$(printf "\e[38;2;%d;%d;%dm" "$red" "$green" "$blue")"
-    line_end="$(printf "\e[39;m")"
+    line_start="$(printf "\033[38;2;%d;%d;%dm" "$red" "$green" "$blue")"
+    line_end="$(printf "\033[39;m")"
 
     id4th="$(expr \( "$image_id" / 16777216 \) % 256 )"
     eval "id_diacritic=\$d${id4th}"
 
     # Reset the brush state, mostly to reset the underline color.
-    printf "\e[0m"
+    printf "\033[0m"
 
     # Fill the output with characters representing the image
     for y in $(seq 0 "$(expr "$rows" - 1)"); do
@@ -563,7 +576,7 @@ print_placeholder() {
         printf "%s\n" "$line"
     done
 
-    printf "\e[0m"
+    printf "\033[0m"
 }
 
 d0="̅"

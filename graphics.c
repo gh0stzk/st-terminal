@@ -43,7 +43,9 @@
 
 #include <assert.h>
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <spawn.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -53,7 +55,6 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
-#include <errno.h>
 
 #include "khash.h"
 #include "kvec.h"
@@ -105,7 +106,6 @@ enum ImageStatus {
 	STATUS_UPLOADING_ERROR = 2,
 	STATUS_UPLOADING_SUCCESS = 3,
 	STATUS_RAM_LOADING_ERROR = 4,
-	STATUS_RAM_LOADING_IN_PROGRESS = 5,
 	STATUS_RAM_LOADING_SUCCESS = 6,
 };
 
@@ -124,15 +124,17 @@ enum ImageUploadingFailure {
 	ERROR_UNEXPECTED_SIZE = 3,
 	ERROR_CANNOT_COPY_FILE = 4,
 	ERROR_CANNOT_OPEN_SHM = 5,
+	ERROR_MTIME_MISMATCH = 3,
 };
 
-const char *image_uploading_failure_strings[6] = {
+const char *image_uploading_failure_strings[7] = {
 	"NO_ERROR",
 	"ERROR_OVER_SIZE_LIMIT",
 	"ERROR_CANNOT_OPEN_CACHED_FILE",
 	"ERROR_UNEXPECTED_SIZE",
 	"ERROR_CANNOT_COPY_FILE",
 	"ERROR_CANNOT_OPEN_SHM",
+	"ERROR_MTIME_MISMATCH",
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -179,6 +181,17 @@ struct ImagePlacement;
 KHASH_MAP_INIT_INT(id2image, struct Image *)
 KHASH_MAP_INIT_INT(id2placement, struct ImagePlacement *)
 
+/// A transformation to apply to a pixmap before drawing it.
+typedef struct PixmapTransformation {
+	/// The width and height of the pixmap.
+	int pixmap_w, pixmap_h;
+	/// The width and height of the transformed pixmap.
+	int dst_w, dst_h;
+	/// The offset relative to the top-left corner of the box of cells where
+	/// the transformed pixmap is drawn.
+	int dst_x, dst_y;
+} PixmapTransformation;
+
 typedef struct ImageFrame {
 	/// The image this frame belongs to.
 	struct Image *image;
@@ -206,12 +219,20 @@ typedef struct ImageFrame {
 	char compression;
 	/// The status (see `ImageStatus`).
 	char status;
+	/// Whether loading into ram is in progress. This is used to avoid
+	/// cyclic dependencies between frames.
+	char ram_loading_in_progress;
 	/// The reason of uploading failure (see `ImageUploadingFailure`).
 	char uploading_failure;
 	/// Whether failures and successes should be reported ('q=').
 	char quiet;
 	/// Whether to blend the frame with the background or replace it.
 	char blend;
+	/// The original file name used with file transmission. Malloced.
+	char *original_filename;
+	/// The modification time of the original file used with file
+	/// transmission.
+	time_t original_file_mtime;
 	/// The file corresponding to the on-disk cache, used when uploading.
 	FILE *open_file;
 	/// The size of the corresponding file cached on disk.
@@ -298,6 +319,8 @@ typedef struct ImagePlacement {
 	/// The dimensions of the cell used to scale the image. If cell
 	/// dimensions are changed (font change), the image will be rescaled.
 	uint16_t scaled_cw, scaled_ch;
+	/// The transformation to apply to the pixmap before drawing it.
+	PixmapTransformation pixmap_transformation;
 	/// If true, do not move the cursor when displaying this placement
 	/// (non-virtual placements only).
 	char do_not_move_cursor;
@@ -358,6 +381,7 @@ static void gr_get_frame_filename(ImageFrame *frame, char *out, size_t max_len);
 static void gr_delete_image(Image *img);
 static void gr_erase_placement(ImagePlacement *placement);
 static void gr_check_limits();
+static void gr_try_restore_imagefile(ImageFrame *frame);
 static char *gr_base64dec(const char *src, size_t *size);
 static void sanitize_str(char *str, size_t max_len);
 static const char *sanitized_filename(const char *str);
@@ -417,6 +441,11 @@ extern unsigned graphics_max_total_placements;
 extern double graphics_excess_tolerance_ratio;
 extern unsigned graphics_animation_min_delay;
 
+// Constants that are not important enough to expose in the config.
+
+/// The time after which an interrupted (with another command) direct
+/// transmission cannot be resumed.
+static Milliseconds graphics_direct_transmission_timeout_ms = 2000;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Basic helpers.
@@ -614,8 +643,8 @@ static unsigned gr_frame_current_ram_size(ImageFrame *frame) {
 
 /// Returns the (estimation) of the RAM size used by a single frame pixmap.
 static unsigned gr_placement_single_frame_ram_size(ImagePlacement *placement) {
-	return (unsigned)placement->rows * placement->cols *
-	       placement->scaled_ch * placement->scaled_cw * 4;
+	return (unsigned)placement->pixmap_transformation.pixmap_w *
+	       placement->pixmap_transformation.pixmap_h * 4;
 }
 
 /// Returns the (estimation) of the RAM size used by the placemenet right now.
@@ -704,14 +733,19 @@ static void gr_unload_pixmap(ImagePlacement *placement, int frameidx) {
 	       gr_placement_single_frame_ram_size(placement) / 1024);
 }
 
+/// Closes the on-disk cache file of the frame `frame`.
+static void gr_close_disk_cache_file(ImageFrame *frame) {
+	if (frame && frame->open_file) {
+		fclose(frame->open_file);
+		frame->open_file = NULL;
+	}
+}
+
 /// Deletes the on-disk cache file corresponding to the frame. The in-ram image
 /// object (if it exists) is not deleted, placements are not unloaded either.
 static void gr_delete_imagefile(ImageFrame *frame) {
 	// It may still be being loaded. Close the file in this case.
-	if (frame->open_file) {
-		fclose(frame->open_file);
-		frame->open_file = NULL;
-	}
+	gr_close_disk_cache_file(frame);
 
 	if (frame->disk_size == 0)
 		return;
@@ -775,6 +809,8 @@ static void gr_delete_image_keep_id(Image *img) {
 	foreach_frame(*img, frame, {
 		gr_delete_imagefile(frame);
 		gr_unload_frame(frame);
+		if (frame->original_filename)
+			free(frame->original_filename);
 	});
 	kv_destroy(img->frames_beyond_the_first);
 	gr_delete_all_placements(img);
@@ -1087,6 +1123,25 @@ static void gr_update_frame_index(Image *img, Milliseconds now) {
 ////////////////////////////////////////////////////////////////////////////////
 // Unloading and deleting images to save resources.
 ////////////////////////////////////////////////////////////////////////////////
+
+/// Returns whether the original file of the frame is still available (exists,
+/// is a regular file, has the same size and mtime).
+static int gr_is_original_file_still_available(ImageFrame *frame) {
+	if (!frame->original_filename)
+		return 0;
+	struct stat st;
+	if (stat(frame->original_filename, &st) != 0)
+		return 0;
+	if (!S_ISREG(st.st_mode))
+		return 0;
+	if (st.st_size == 0 || st.st_size > graphics_max_single_image_file_size)
+		return 0;
+	if (frame->expected_size && st.st_size != frame->expected_size)
+		return 0;
+	if (st.st_mtime != frame->original_file_mtime)
+		return 0;
+	return 1;
+}
 
 /// A helper to compare frames by atime for qsort.
 static int gr_cmp_frames_by_atime(const void *a, const void *b) {
@@ -1599,7 +1654,13 @@ static void gr_load_imlib_object(ImageFrame *frame) {
 	if (frame->status < STATUS_UPLOADING_SUCCESS)
 		return;
 	if (frame->disk_size == 0) {
-		if (frame->status != STATUS_RAM_LOADING_ERROR) {
+		// In some cases the original image file may still be available,
+		// try to restore it.
+		gr_try_restore_imagefile(frame);
+	}
+	if (frame->disk_size == 0) {
+		if (frame->status != STATUS_RAM_LOADING_ERROR &&
+		    frame->status >= STATUS_UPLOADING_SUCCESS) {
 			fprintf(stderr,
 				"error: cached image was deleted: %u frame %u\n",
 				frame->image->image_id, frame->index);
@@ -1609,14 +1670,17 @@ static void gr_load_imlib_object(ImageFrame *frame) {
 	}
 
 	// Prevent recursive dependences between frames.
-	if (frame->status == STATUS_RAM_LOADING_IN_PROGRESS) {
-		fprintf(stderr,
-			"error: recursive loading of image %u frame %u\n",
-			frame->image->image_id, frame->index);
+	if (frame->ram_loading_in_progress) {
+		if (frame->status != STATUS_RAM_LOADING_ERROR) {
+			fprintf(stderr,
+				"error: recursive loading of image %u frame "
+				"%u\n",
+				frame->image->image_id, frame->index);
+		}
 		frame->status = STATUS_RAM_LOADING_ERROR;
 		return;
 	}
-	frame->status = STATUS_RAM_LOADING_IN_PROGRESS;
+	frame->ram_loading_in_progress = 1;
 
 	// Load the background frame if needed. Hopefully it's not recursive.
 	ImageFrame *bg_frame = NULL;
@@ -1624,25 +1688,31 @@ static void gr_load_imlib_object(ImageFrame *frame) {
 		bg_frame = gr_get_frame(frame->image,
 					frame->background_frame_index);
 		if (!bg_frame) {
-			fprintf(stderr,
-				"error: could not find background "
-				"frame %d for image %u frame %d\n",
-				frame->background_frame_index,
-				frame->image->image_id, frame->index);
-			frame->status = STATUS_RAM_LOADING_ERROR;
+			if (frame->status != STATUS_RAM_LOADING_ERROR) {
+				fprintf(stderr,
+					"error: could not find background "
+					"frame %d for image %u frame %d\n",
+					frame->background_frame_index,
+					frame->image->image_id, frame->index);
+				frame->status = STATUS_RAM_LOADING_ERROR;
+			}
 			return;
 		}
 		gr_load_imlib_object(bg_frame);
 		if (!bg_frame->imlib_object) {
-			fprintf(stderr,
-				"error: could not load background frame %d for "
-				"image %u frame %d\n",
-				frame->background_frame_index,
-				frame->image->image_id, frame->index);
+			if (frame->status != STATUS_RAM_LOADING_ERROR) {
+				fprintf(stderr,
+					"error: could not load background "
+					"frame %d for image %u frame %d\n",
+					frame->background_frame_index,
+					frame->image->image_id, frame->index);
+			}
 			frame->status = STATUS_RAM_LOADING_ERROR;
 			return;
 		}
 	}
+
+	frame->ram_loading_in_progress = 0;
 
 	// We exclude background frames from the time to load the frame.
 	Milliseconds loading_start = gr_now_ms();
@@ -1670,6 +1740,25 @@ static void gr_load_imlib_object(ImageFrame *frame) {
 	imlib_context_set_image(frame_data_image);
 	int frame_data_width = imlib_image_get_width();
 	int frame_data_height = imlib_image_get_height();
+
+	// Check that the size of the image we are loading does not exceed the
+	// limit.
+	if (frame_data_width * frame_data_height * 4 >
+	    graphics_max_single_image_ram_size) {
+		if (frame->status != STATUS_RAM_LOADING_ERROR) {
+			fprintf(stderr,
+				"error: image %u frame %u is too big too load: "
+				"%d x %d * 4 = %d > %u\n",
+				frame->image->image_id, frame->index,
+				frame_data_width, frame_data_height,
+				frame_data_width * frame_data_height * 4,
+				graphics_max_single_image_ram_size);
+		}
+		imlib_free_image();
+		frame->status = STATUS_RAM_LOADING_ERROR;
+		return;
+	}
+
 	GR_LOG("Successfully loaded, size %d x %d\n", frame_data_width,
 	       frame_data_height);
 	// If imlib loading succeeded, and it is the first frame, set the
@@ -1756,8 +1845,125 @@ static void gr_premultiply_alpha(DATA32 *data, size_t num_pixels) {
 	}
 }
 
-/// Creates a pixmap for the frame of an image placement. The pixmap contain the
-/// image data correctly scaled and fit to the box defined by the number of
+/// Computes the pixmap transformation, which is essentially the destination
+/// rectangle for drawing an image placement in a box of size `cols*cw` x
+/// `rows*ch`. The destination rectangle depends on the parameters of the
+/// placement, like scaling mode. The computed transformation is stored in the
+/// placement.
+void gr_compute_pixmap_transformation(ImagePlacement *placement) {
+	// Infer the placement size if needed.
+	gr_infer_placement_size_maybe(placement);
+
+	// The size of the box in which the image is placed.
+	int box_w = (int)placement->cols * placement->scaled_cw;
+	int box_h = (int)placement->rows * placement->scaled_ch;
+
+	int src_w = placement->src_pix_width;
+	int src_h = placement->src_pix_height;
+
+	// Whether the box is too small to use the true size of the image.
+	char box_too_small = box_w < src_w || box_h < src_h;
+	char mode = placement->scale_mode;
+
+	PixmapTransformation *tr = &placement->pixmap_transformation;
+
+	if (src_w <= 0 || src_h <= 0) {
+		tr->dst_x = tr->dst_y = tr->dst_w = tr->dst_h = 0;
+	} else if (mode == SCALE_MODE_FILL) {
+		tr->dst_x = tr->dst_y = 0;
+		tr->dst_w = box_w;
+		tr->dst_h = box_h;
+	} else if (mode == SCALE_MODE_NONE ||
+		   (mode == SCALE_MODE_NONE_OR_CONTAIN && !box_too_small)) {
+		tr->dst_x = tr->dst_y = 0;
+		tr->dst_w = src_w;
+		tr->dst_h = src_h;
+	} else {
+		if (mode != SCALE_MODE_CONTAIN &&
+		    mode != SCALE_MODE_NONE_OR_CONTAIN) {
+			fprintf(stderr,
+				"warning: unknown scale mode %u, using "
+				"'contain' instead\n",
+				mode);
+		}
+		if (box_w * src_h > src_w * box_h) {
+			// If the box is wider than the original image, fit to
+			// height.
+			tr->dst_h = box_h;
+			tr->dst_y = 0;
+			tr->dst_w = src_w * box_h / src_h;
+			tr->dst_x = (box_w - tr->dst_w) / 2;
+		} else {
+			// Otherwise, fit to width.
+			tr->dst_w = box_w;
+			tr->dst_x = 0;
+			tr->dst_h = src_h * box_w / src_w;
+			tr->dst_y = (box_h - tr->dst_h) / 2;
+		}
+	}
+
+	// Make sure that the size of the destination image is non-zero.
+	tr->dst_w = MAX(1, tr->dst_w);
+	tr->dst_h = MAX(1, tr->dst_h);
+
+	// Normally we want the pixmap to be exactly the size of the destination
+	// rectangle.
+	tr->pixmap_w = tr->dst_w;
+	tr->pixmap_h = tr->dst_h;
+	// However, if the pixmap would be larger than the source image, use the
+	// source image size. The upscaling will be done by XRender then.
+	if (tr->pixmap_w * tr->pixmap_h > src_w * src_h) {
+		tr->pixmap_w = MAX(1, src_w);
+		tr->pixmap_h = MAX(1, src_h);
+	}
+
+	// If the pixmap would be over the limit, scale it down.
+	if (tr->pixmap_w * tr->pixmap_h * 4 >
+	    graphics_max_single_image_ram_size) {
+		double scale = sqrt((double)graphics_max_single_image_ram_size /
+				    (tr->pixmap_w * tr->pixmap_h * 4));
+		tr->pixmap_w = MAX(1, (int)(tr->pixmap_w * scale));
+		tr->pixmap_h = MAX(1, (int)(tr->pixmap_h * scale));
+	}
+}
+
+/// Creates and returns a scaled imlib image for the image placement. The
+/// original imlib object must be loaded and the placement size must be inferred
+/// by the caller (by calling `gr_compute_pixmap_transformation`). The caller is
+/// responsible for freeing the returned image.
+Imlib_Image gr_create_scaled_image_object(ImagePlacement *placement,
+					  ImageFrame *frame) {
+	// The source rectangle (inside the original image).
+	int src_x = placement->src_pix_x;
+	int src_y = placement->src_pix_y;
+	int src_w = placement->src_pix_width;
+	int src_h = placement->src_pix_height;
+	// The pixmap dimensions.
+	int pixmap_w = placement->pixmap_transformation.pixmap_w;
+	int pixmap_h = placement->pixmap_transformation.pixmap_h;
+
+	if (pixmap_w * pixmap_h * 4 > graphics_max_single_image_ram_size) {
+		fprintf(stderr,
+			"error: placement %u/%u would be too big to load: %d x "
+			"%d x 4 > %u\n",
+			placement->image->image_id, placement->placement_id,
+			pixmap_w, pixmap_h, graphics_max_single_image_ram_size);
+		return 0;
+	}
+
+	if (pixmap_w == 0 || pixmap_h == 0)
+		fprintf(stderr, "warning: image of zero size\n");
+
+	imlib_context_set_image(frame->imlib_object);
+	imlib_context_set_anti_alias(1);
+	imlib_context_set_blend(1);
+
+	return imlib_create_cropped_scaled_image(src_x, src_y, src_w, src_h,
+						 pixmap_w, pixmap_h);
+}
+
+/// Creates a pixmap for the frame of an image placement. The pixmap contains
+/// the image data correctly scaled and fit to the box defined by the number of
 /// rows/columns of the image placement and the provided cell dimensions in
 /// pixels. If the placement is already loaded, it will be reloaded only if the
 /// cell dimensions have changed.
@@ -1766,16 +1972,18 @@ Pixmap gr_load_pixmap(ImagePlacement *placement, int frameidx, int cw, int ch) {
 	Image *img = placement->image;
 	ImageFrame *frame = gr_get_frame(img, frameidx);
 
-	// Update the atime uncoditionally.
+	// Update the atime unconditionally.
 	gr_touch_placement(placement);
 	if (frame)
 		gr_touch_frame(frame);
 
-	// If cw or ch are different, unload all the pixmaps.
+	// If cw or ch are different, unload all the pixmaps and recompute the
+	// pixmap geometry and transformation (shared for all pixmaps).
 	if (placement->scaled_cw != cw || placement->scaled_ch != ch) {
 		gr_unload_placement(placement);
 		placement->scaled_cw = cw;
 		placement->scaled_ch = ch;
+		gr_compute_pixmap_transformation(placement);
 	}
 
 	// If it's already loaded, do nothing.
@@ -1785,6 +1993,12 @@ Pixmap gr_load_pixmap(ImagePlacement *placement, int frameidx, int cw, int ch) {
 
 	GR_LOG("Loading placement: %u/%u frame %u\n", img->image_id,
 	       placement->placement_id, frameidx);
+
+	if (placement->pixmap_transformation.pixmap_w == 0 ||
+	    placement->pixmap_transformation.pixmap_h == 0) {
+		GR_LOG("Not loading because the pixmap size is zero\n");
+		return 0;
+	}
 
 	// Load the imlib object for the frame.
 	if (!frame) {
@@ -1797,92 +2011,19 @@ Pixmap gr_load_pixmap(ImagePlacement *placement, int frameidx, int cw, int ch) {
 	if (!frame->imlib_object)
 		return 0;
 
-	// Infer the placement size if needed.
-	gr_infer_placement_size_maybe(placement);
-
-	// Create the scaled image. This is temporary, we will scale it
-	// appropriately, upload to the X server, and then delete immediately.
-	int scaled_w = (int)placement->cols * cw;
-	int scaled_h = (int)placement->rows * ch;
-	if (scaled_w * scaled_h * 4 > graphics_max_single_image_ram_size) {
-		fprintf(stderr,
-			"error: placement %u/%u would be too big to load: %d x "
-			"%d x 4 > %u\n",
-			img->image_id, placement->placement_id, scaled_w,
-			scaled_h, graphics_max_single_image_ram_size);
+	// Create the scaled image. This is temporary, we will upload to the X
+	// server, and then delete immediately.
+	Imlib_Image scaled_image =
+		gr_create_scaled_image_object(placement, frame);
+	if (!scaled_image)
 		return 0;
-	}
-	Imlib_Image scaled_image = imlib_create_image(scaled_w, scaled_h);
-	if (!scaled_image) {
-		fprintf(stderr,
-			"error: imlib_create_image(%d, %d) returned "
-			"null\n",
-			scaled_w, scaled_h);
-		return 0;
-	}
 	imlib_context_set_image(scaled_image);
-	imlib_image_set_has_alpha(1);
-
-	// First fill the scaled image with the transparent color.
-	imlib_context_set_blend(0);
-	imlib_context_set_color(0, 0, 0, 0);
-	imlib_image_fill_rectangle(0, 0, scaled_w, scaled_h);
-	imlib_context_set_anti_alias(1);
-	imlib_context_set_blend(1);
-
-	// The source rectangle.
-	int src_x = placement->src_pix_x;
-	int src_y = placement->src_pix_y;
-	int src_w = placement->src_pix_width;
-	int src_h = placement->src_pix_height;
-	// Whether the box is too small to use the true size of the image.
-	char box_too_small = scaled_w < src_w || scaled_h < src_h;
-	char mode = placement->scale_mode;
-
-	// Then blend the original image onto the transparent background.
-	if (src_w <= 0 || src_h <= 0) {
-		fprintf(stderr, "warning: image of zero size\n");
-	} else if (mode == SCALE_MODE_FILL) {
-		imlib_blend_image_onto_image(frame->imlib_object, 1, src_x,
-					     src_y, src_w, src_h, 0, 0,
-					     scaled_w, scaled_h);
-	} else if (mode == SCALE_MODE_NONE ||
-		   (mode == SCALE_MODE_NONE_OR_CONTAIN && !box_too_small)) {
-		imlib_blend_image_onto_image(frame->imlib_object, 1, src_x,
-					     src_y, src_w, src_h, 0, 0, src_w,
-					     src_h);
-	} else {
-		if (mode != SCALE_MODE_CONTAIN &&
-		    mode != SCALE_MODE_NONE_OR_CONTAIN) {
-			fprintf(stderr,
-				"warning: unknown scale mode %u, using "
-				"'contain' instead\n",
-				mode);
-		}
-		int dest_x, dest_y;
-		int dest_w, dest_h;
-		if (scaled_w * src_h > src_w * scaled_h) {
-			// If the box is wider than the original image, fit to
-			// height.
-			dest_h = scaled_h;
-			dest_y = 0;
-			dest_w = src_w * scaled_h / src_h;
-			dest_x = (scaled_w - dest_w) / 2;
-		} else {
-			// Otherwise, fit to width.
-			dest_w = scaled_w;
-			dest_x = 0;
-			dest_h = src_h * scaled_w / src_w;
-			dest_y = (scaled_h - dest_h) / 2;
-		}
-		imlib_blend_image_onto_image(frame->imlib_object, 1, src_x,
-					     src_y, src_w, src_h, dest_x,
-					     dest_y, dest_w, dest_h);
-	}
+	int pixmap_w = imlib_image_get_width();
+	int pixmap_h = imlib_image_get_height();
 
 	// XRender needs the alpha channel premultiplied.
 	DATA32 *data = imlib_image_get_data();
-	gr_premultiply_alpha(data, scaled_w * scaled_h);
+	gr_premultiply_alpha(data, pixmap_w * pixmap_h);
 
 	// Upload the image to the X server.
 	Display *disp = imlib_context_get_display();
@@ -1891,7 +2032,7 @@ Pixmap gr_load_pixmap(ImagePlacement *placement, int frameidx, int cw, int ch) {
 	Drawable drawable = imlib_context_get_drawable();
 	if (!drawable)
 		drawable = DefaultRootWindow(disp);
-	pixmap = XCreatePixmap(disp, drawable, scaled_w, scaled_h, 32);
+	pixmap = XCreatePixmap(disp, drawable, pixmap_w, pixmap_h, 32);
 	XVisualInfo visinfo = {0};
 	Status visual_found = XMatchVisualInfo(disp, DefaultScreen(disp), 32,
 					       TrueColor, &visinfo) ||
@@ -1904,7 +2045,7 @@ Pixmap gr_load_pixmap(ImagePlacement *placement, int frameidx, int cw, int ch) {
 		visinfo.visual = NULL;
 	}
 	XImage *ximage = XCreateImage(disp, visinfo.visual, 32, ZPixmap, 0,
-				      (char *)data, scaled_w, scaled_h, 32, 0);
+				      (char *)data, pixmap_w, pixmap_h, 32, 0);
 	if (!ximage) {
 		fprintf(stderr, "error: could not create XImage\n");
 		imlib_image_put_back_data(data);
@@ -1912,8 +2053,7 @@ Pixmap gr_load_pixmap(ImagePlacement *placement, int frameidx, int cw, int ch) {
 		return 0;
 	}
 	GC gc = XCreateGC(disp, pixmap, 0, NULL);
-	XPutImage(disp, pixmap, gc, ximage, 0, 0, 0, 0, scaled_w,
-		  scaled_h);
+	XPutImage(disp, pixmap, gc, ximage, 0, 0, 0, 0, pixmap_w, pixmap_h);
 	XFreeGC(disp, gc);
 	// XDestroyImage will free the data as well, but it is managed by imlib,
 	// so set it to NULL.
@@ -2096,6 +2236,14 @@ static void gr_dump_frame_info(FILE *file, ImageFrame *frame, int ind) {
 		fprintf_ind(file, ind, "NOT INITIALIZED\n");
 		return;
 	}
+	if (frame->original_filename) {
+		fprintf_ind(file, ind, "original filename (sanitized): %s\n",
+			    sanitized_filename(frame->original_filename));
+		fprintf_ind(file, ind, "original file %s\n",
+			    gr_is_original_file_still_available(frame)
+				    ? "is still available"
+				    : "is NOT available anymore");
+	}
 	if (frame->uploading_failure)
 		fprintf_ind(file, ind, "uploading failure: %s\n",
 			    image_uploading_failure_strings
@@ -2141,6 +2289,11 @@ static void gr_dump_placement_info(FILE *file, ImagePlacement *placement,
 		    placement->rows);
 	fprintf_ind(file, ind, "cell size: %ux%u\n", placement->scaled_cw,
 		    placement->scaled_ch);
+	PixmapTransformation *tr = &placement->pixmap_transformation;
+	fprintf_ind(file, ind, "pixmap size: %ux%u\n", tr->pixmap_w,
+		    tr->pixmap_h);
+	fprintf_ind(file, ind, "dst size: %ux%u  offset: (%d, %d)\n", tr->dst_w,
+		    tr->dst_h, tr->dst_x, tr->dst_y);
 	fprintf_ind(file, ind, "ram per frame: %u KiB\n",
 		    gr_placement_single_frame_ram_size(placement) / 1024);
 	unsigned ram_size = gr_placement_current_ram_size(placement);
@@ -2442,14 +2595,17 @@ static void gr_drawimagerect(Drawable buf, ImageRect *rect) {
 		return;
 	}
 
+	// The coordinates and size (in pixels) of the src rectangle inside the
+	// box of cells (not the pixmap).
 	int src_x = rect->img_start_col * rect->cw;
 	int src_y = rect->img_start_row * rect->ch;
-	int width = (rect->img_end_col - rect->img_start_col) * rect->cw;
-	int height = (rect->img_end_row - rect->img_start_row) * rect->ch;
-	int dst_x = rect->screen_x_pix;
-	int dst_y = rect->screen_y_pix;
+	int src_w = (rect->img_end_col - rect->img_start_col) * rect->cw;
+	int src_h = (rect->img_end_row - rect->img_start_row) * rect->ch;
+	// The coordinates of the dst rectangle inside the window. The size is
+	// the same as the src size in the box (src_w, src_h).
+	int window_x = rect->screen_x_pix;
+	int window_y = rect->screen_y_pix;
 
-	// Display the image.
 	Display *disp = imlib_context_get_display();
 	Visual *vis = imlib_context_get_visual();
 
@@ -2464,10 +2620,8 @@ static void gr_drawimagerect(Drawable buf, ImageRect *rect) {
 	// premultiplied. But the result is good enough to visually indicate
 	// selection.
 	if (rect->reverse) {
-		unsigned pixmap_w =
-			(unsigned)placement->cols * placement->scaled_cw;
-		unsigned pixmap_h =
-			(unsigned)placement->rows * placement->scaled_ch;
+		unsigned pixmap_w = placement->pixmap_transformation.pixmap_w;
+		unsigned pixmap_h = placement->pixmap_transformation.pixmap_h;
 		Pixmap invpixmap =
 			XCreatePixmap(disp, buf, pixmap_w, pixmap_h, 32);
 		XGCValues gcv = {.function = GXcopyInverted};
@@ -2481,16 +2635,71 @@ static void gr_drawimagerect(Drawable buf, ImageRect *rect) {
 	// Create a picture for the image pixmap.
 	XRenderPictFormat *pic_format =
 		XRenderFindStandardFormat(disp, PictStandardARGB32);
-	Picture pixmap_pic =
-		XRenderCreatePicture(disp, pixmap, pic_format, 0, NULL);
+	// We use RepeatPad to avoid bilinear filtering halo.
+	XRenderPictureAttributes attrs = {0};
+	attrs.repeat = RepeatPad;
+	Picture pixmap_pic = XRenderCreatePicture(disp, pixmap, pic_format,
+						  CPRepeat, &attrs);
+
+	// Since the pixmap may be of different size than the destination box of
+	// cells, we must apply a transformation to it.
+	// The XTransform structure describes a matrix to transform the
+	// destination picture coordinates (i.e. in the box) to the source
+	// coordinates (i.e. in the pixmap). We apply only scaling (translation
+	// will be applied to the src coordinates directly):
+	//
+	//   pixmap_x = picture_x * pixmap_w / dst_w
+	//   pixmap_y = picture_y * pixmap_h / dst_h
+	//
+	// Where dst_w, dst_h, pixmap_w, pixmap_h are from the placement's
+	// pixmap_transformation structure.
+	PixmapTransformation *tr = &placement->pixmap_transformation;
+	double xs = (double)tr->pixmap_w / MAX(tr->dst_w, 1);
+	double ys = (double)tr->pixmap_h / MAX(tr->dst_h, 1);
+	// clang-format off
+	XTransform xform = {{
+	    { XDoubleToFixed(xs), XDoubleToFixed( 0), XDoubleToFixed( 0) },
+	    { XDoubleToFixed( 0), XDoubleToFixed(ys), XDoubleToFixed( 0) },
+	    { XDoubleToFixed( 0), XDoubleToFixed( 0), XDoubleToFixed( 1) }
+	}};
+	// clang-format on
+	XRenderSetPictureTransform(disp, pixmap_pic, &xform);
+	XRenderSetPictureFilter(disp, pixmap_pic, FilterBilinear, NULL, 0);
+
+	// Do the translation: modify the src coordinates to make them
+	// coordinates into the picture rather than into the box.
+	src_x -= tr->dst_x;
+	src_y -= tr->dst_y;
+	// At this point src_x, src_y, src_w, src_h are coordinates of the
+	// source rectangle inside the picture (scaled pixmap).
+
+	// Now do clipping. If src coordinates are negative, adjust the dst
+	// coordinates (into the window) and the width/height. We do clipping
+	// instead of using the values as is to avoid rendering the pad area
+	// outside the pixmap.
+	if (src_x < 0) {
+		window_x += -src_x;
+		src_w -= -src_x;
+		src_x = 0;
+	}
+	if (src_y < 0) {
+		window_y += -src_y;
+		src_h -= -src_y;
+		src_y = 0;
+	}
+
+	// Adjust width and height if the src rectangle exceeds the picture.
+	src_w = MIN(src_w, tr->dst_w - src_x);
+	src_h = MIN(src_h, tr->dst_h - src_y);
 
 	// Composite the image onto the window. In the reverse mode we ignore
 	// the alpha channel of the image because the naive inversion above
 	// seems to invert the alpha channel as well.
 	int pictop = rect->reverse ? PictOpSrc : PictOpOver;
-	XRenderComposite(disp, pictop, pixmap_pic, 0, window_pic,
-			 src_x, src_y, src_x, src_y, dst_x, dst_y, width,
-			 height);
+	if (src_w > 0 && src_h > 0)
+		XRenderComposite(disp, pictop, pixmap_pic, 0, window_pic, src_x,
+				 src_y, src_x, src_y, window_x, window_y, src_w,
+				 src_h);
 
 	// Free resources
 	XRenderFreePicture(disp, pixmap_pic);
@@ -2965,6 +3174,96 @@ static void gr_schedule_image_redraw(Image *img) {
 	gr_schedule_image_redraw_by_id(img->image_id);
 }
 
+/// Closes the file currently being uploaded. This doesn't necessarily finish
+/// the upload since the file may be reopened.
+static void gr_close_current_upload_file() {
+	Image *img = gr_find_image(current_upload_image_id);
+	ImageFrame *frame = gr_get_frame(img, current_upload_frame_index);
+	gr_close_disk_cache_file(frame);
+}
+
+/// Sets the current image and frame being uploaded. Closes the previous upload
+/// file if it's changed. If `frame` is NULL, clears the current upload
+/// image/frame.
+static void gr_set_current_upload_frame(ImageFrame *frame) {
+	if (frame) {
+		if (current_upload_image_id != frame->image->image_id ||
+		    current_upload_frame_index != frame->index) {
+			gr_close_current_upload_file();
+		}
+		current_upload_image_id = frame->image->image_id;
+		current_upload_frame_index = frame->index;
+		GR_LOG("Set current_upload_image_id = %u, "
+		       "current_upload_frame_index = %u\n",
+		       current_upload_image_id, current_upload_frame_index);
+	} else {
+		gr_close_current_upload_file();
+		current_upload_image_id = 0;
+		current_upload_frame_index = 0;
+		GR_LOG("Set current_upload_image_id = 0\n");
+	}
+}
+
+/// Returns whether direct transmission continuation is allowed for the given
+/// command and frame.
+static int gr_transmission_continuation_is_allowed(GraphicsCommand *cmd,
+						   ImageFrame *frame) {
+	if (!frame || frame->status != STATUS_UPLOADING)
+		return 0;
+
+	// If it's the same image and frame as the current upload, allow it.
+	if (current_upload_image_id == frame->image->image_id &&
+	    current_upload_frame_index == frame->index)
+		return 1;
+
+	// Otherwise it's a continuation of an interrupted upload. The kitty
+	// graphics protocol doesn't allow interleaving of direct transmission
+	// with other commands, so interrupted uploads must be aborted. However,
+	// we still allow it as an extension, because it's useful for
+	// protocol-unaware multiplexer. We check that there are no
+	// contradictions, and the time since the last upload activity is small.
+
+	if (cmd->size && cmd->size != frame->expected_size) {
+		fprintf(stderr, "warning: Not resuming interrupted upload "
+				"because of expected size mismatch\n");
+		return 0;
+	}
+	if (cmd->format && cmd->format != frame->format) {
+		fprintf(stderr, "warning: Not resuming interrupted upload "
+				"because of format mismatch\n");
+		return 0;
+	}
+	if (cmd->compression && cmd->compression != frame->compression) {
+		fprintf(stderr, "warning: Not resuming interrupted upload "
+				"because of compression mismatch\n");
+		return 0;
+	}
+	if ((cmd->frame_pix_width &&
+	     cmd->frame_pix_width != frame->data_pix_width) ||
+	    (cmd->frame_pix_height &&
+	     cmd->frame_pix_height != frame->data_pix_height) ||
+	    (cmd->background_color &&
+	     cmd->background_color != frame->background_color) ||
+	    (cmd->background_frame &&
+	     cmd->background_frame != frame->background_frame_index) ||
+	    (cmd->gap && cmd->gap != frame->gap) ||
+	    (cmd->replace_instead_of_blending &&
+	     cmd->replace_instead_of_blending != !frame->blend)) {
+		fprintf(stderr, "warning: Not resuming interrupted upload "
+				"because of frame parameters mismatch\n");
+		return 0;
+	}
+
+	Milliseconds now = gr_now_ms();
+	if (now - frame->atime > graphics_direct_transmission_timeout_ms) {
+		fprintf(stderr, "warning: Not resuming interrupted upload "
+				"because of time out\n");
+		return 0;
+	}
+
+	return 1;
+}
+
 /// Appends `data` to the on-disk cache file of the frame `frame`. Creates the
 /// file if it doesn't exist. Updates `frame->disk_size` and the total disk
 /// size. Returns 1 on success and 0 on failure.
@@ -2995,29 +3294,12 @@ static int gr_append_raw_data_to_file(ImageFrame *frame, const char *data,
 /// (`!more`) to avoid spamming the client. If the frame is not specified, use
 /// the image id and frame index we are currently uploading.
 static void gr_append_data(ImageFrame *frame, const char *payload, int more) {
-	if (!frame) {
-		Image *img = gr_find_image(current_upload_image_id);
-		frame = gr_get_frame(img, current_upload_frame_index);
-		GR_LOG("Appending data to image %u frame %d\n",
-		       current_upload_image_id, current_upload_frame_index);
-		if (!img)
-			GR_LOG("ERROR: this image doesn't exist\n");
-		if (!frame)
-			GR_LOG("ERROR: this frame doesn't exist\n");
-	}
-	if (!more) {
-		current_upload_image_id = 0;
-		current_upload_frame_index = 0;
-	}
-	if (!frame) {
-		if (!more)
-			gr_reporterror_frame(NULL, "ENOENT: could not find the "
-						   "image to append data to");
-		return;
-	}
+	gr_set_current_upload_frame(frame);
+
 	if (frame->status != STATUS_UPLOADING) {
 		if (!more)
 			gr_reportuploaderror(frame);
+		gr_set_current_upload_frame(NULL);
 		return;
 	}
 
@@ -3037,6 +3319,7 @@ static void gr_append_data(ImageFrame *frame, const char *payload, int more) {
 		frame->uploading_failure = ERROR_OVER_SIZE_LIMIT;
 		if (!more)
 			gr_reportuploaderror(frame);
+		gr_set_current_upload_frame(NULL);
 		return;
 	}
 
@@ -3046,21 +3329,13 @@ static void gr_append_data(ImageFrame *frame, const char *payload, int more) {
 		frame->uploading_failure = ERROR_CANNOT_OPEN_CACHED_FILE;
 		if (!more)
 			gr_reportuploaderror(frame);
+		gr_set_current_upload_frame(NULL);
 		return;
 	}
 	free(data);
 
-	if (more) {
-		current_upload_image_id = frame->image->image_id;
-		current_upload_frame_index = frame->index;
-	} else {
-		current_upload_image_id = 0;
-		current_upload_frame_index = 0;
-		// Close the file.
-		if (frame->open_file) {
-			fclose(frame->open_file);
-			frame->open_file = NULL;
-		}
+	if (!more) {
+		gr_set_current_upload_frame(NULL);
 		frame->status = STATUS_UPLOADING_SUCCESS;
 		uint32_t placement_id = frame->image->default_placement;
 		if (frame->expected_size &&
@@ -3187,6 +3462,120 @@ static void gr_delete_tmp_file(const char *filename) {
 	unlink(filename);
 }
 
+/// Copy the image file `frame->original_filename` to the cache directory. This
+/// is done when the image is transmitted via file transfer, or when we have
+/// evicted the image from the disk cache and need to restore it.
+/// If `cmd` is not NULL, it's used to report errors, otherwise errors are only
+/// printed to stderr.
+static void gr_copy_imagefile(ImageFrame *frame, GraphicsCommand *cmd) {
+	GR_LOG("Copying image %s\n",
+	       sanitized_filename(frame->original_filename));
+	// Stat the file and check that it's a regular file and not too big.
+	struct stat st;
+	int stat_res = stat(frame->original_filename, &st);
+
+	const char *stat_error = NULL;
+	if (stat_res)
+		stat_error = strerror(errno);
+	else if (!S_ISREG(st.st_mode))
+		stat_error = "Not a regular file";
+	else if (st.st_size == 0)
+		stat_error = "The size of the file is zero";
+	else if (st.st_size > graphics_max_single_image_file_size)
+		stat_error = "The file is too large";
+	if (stat_error) {
+		fprintf(stderr, "Could not load the file %s: %s\n",
+			sanitized_filename(frame->original_filename),
+			stat_error);
+		if (cmd)
+			gr_reporterror_cmd(cmd, "EBADF: %s", stat_error);
+		frame->status = STATUS_UPLOADING_ERROR;
+		frame->uploading_failure = ERROR_CANNOT_COPY_FILE;
+		return;
+	}
+
+	// Check the expected size if specified.
+	if (frame->expected_size && frame->expected_size != st.st_size) {
+		fprintf(stderr,
+			"Could not load, the size doesn't match: %s expected "
+			"%u vs actual %ld\n",
+			sanitized_filename(frame->original_filename),
+			frame->expected_size, st.st_size);
+		// The file has unexpected size.
+		frame->status = STATUS_UPLOADING_ERROR;
+		frame->uploading_failure = ERROR_UNEXPECTED_SIZE;
+		if (cmd)
+			gr_reportuploaderror(frame);
+		return;
+	}
+
+	// If we know the original modification time, we are trying to restore
+	// the evicted image file. Check that the modification time matches.
+	if (frame->original_file_mtime &&
+	    frame->original_file_mtime != st.st_mtime) {
+		fprintf(stderr, "Could not load, the mtime doesn't match: %s\n",
+			sanitized_filename(frame->original_filename));
+		frame->status = STATUS_UPLOADING_ERROR;
+		frame->uploading_failure = ERROR_MTIME_MISMATCH;
+		if (cmd)
+			gr_reportuploaderror(frame);
+		return;
+	}
+
+	frame->original_file_mtime = st.st_mtime;
+
+	gr_make_sure_tmpdir_exists();
+	// Build the filename for the cached copy of the file.
+	char cache_filename[MAX_FILENAME_SIZE];
+	gr_get_frame_filename(frame, cache_filename, MAX_FILENAME_SIZE);
+	// We will create a symlink to the original file, and
+	// then copy the file to the temporary cache dir. We do
+	// this symlink trick mostly to be able to use cp for
+	// copying, and avoid escaping file name characters when
+	// calling system at the same time.
+	char tmp_filename_symlink[MAX_FILENAME_SIZE + 4] = {0};
+	strcat(tmp_filename_symlink, cache_filename);
+	strcat(tmp_filename_symlink, ".sym");
+	char command[MAX_FILENAME_SIZE + 256];
+	size_t len = snprintf(command, MAX_FILENAME_SIZE + 255, "cp '%s' '%s'",
+			      tmp_filename_symlink, cache_filename);
+
+	if (len > MAX_FILENAME_SIZE + 255 ||
+	    symlink(frame->original_filename, tmp_filename_symlink) ||
+	    system(command) != 0) {
+		fprintf(stderr,
+			"Could not copy the image "
+			"%s (symlink %s) to %s",
+			sanitized_filename(frame->original_filename),
+			tmp_filename_symlink, cache_filename);
+		if (cmd)
+			gr_reporterror_cmd(cmd, "EBADF: could not copy the "
+						"image to the cache dir");
+		frame->status = STATUS_UPLOADING_ERROR;
+		frame->uploading_failure = ERROR_CANNOT_COPY_FILE;
+		// Delete the symlink.
+		unlink(tmp_filename_symlink);
+		return;
+	}
+
+	// Delete the symlink.
+	unlink(tmp_filename_symlink);
+	// Set the status and update disk size variables.
+	frame->status = STATUS_UPLOADING_SUCCESS;
+	frame->disk_size = st.st_size;
+	frame->image->total_disk_size += st.st_size;
+	images_disk_size += frame->disk_size;
+}
+
+/// Tries to restore the image file for `frame` if the original file is still
+/// available.
+static void gr_try_restore_imagefile(ImageFrame *frame) {
+	if (frame->disk_size != 0)
+		return;
+	if (gr_is_original_file_still_available(frame))
+		gr_copy_imagefile(frame, NULL);
+}
+
 /// Handles a data transmission command.
 static ImageFrame *gr_handle_transmit_command(GraphicsCommand *cmd) {
 	// The default is direct transmission.
@@ -3213,93 +3602,23 @@ static ImageFrame *gr_handle_transmit_command(GraphicsCommand *cmd) {
 			return NULL;
 		last_image_id = frame->image->image_id;
 		// Decode the filename.
-		char *original_filename = gr_base64dec(cmd->payload, NULL);
-		GR_LOG("Copying image %s\n",
-		       sanitized_filename(original_filename));
-		// Stat the file and check that it's a regular file and not too
-		// big.
-		struct stat st;
-		int stat_res = stat(original_filename, &st);
-		const char *stat_error = NULL;
-		if (stat_res)
-			stat_error = strerror(errno);
-		else if (!S_ISREG(st.st_mode))
-			stat_error = "Not a regular file";
-		else if (st.st_size == 0)
-			stat_error = "The size of the file is zero";
-		else if (st.st_size > graphics_max_single_image_file_size)
-			stat_error = "The file is too large";
-		if (stat_error) {
-			gr_reporterror_cmd(cmd,
-					   "EBADF: %s", stat_error);
-			fprintf(stderr, "Could not load the file %s\n",
-				sanitized_filename(original_filename));
-			frame->status = STATUS_UPLOADING_ERROR;
-			frame->uploading_failure = ERROR_CANNOT_COPY_FILE;
-		} else {
-			gr_make_sure_tmpdir_exists();
-			// Build the filename for the cached copy of the file.
-			char cache_filename[MAX_FILENAME_SIZE];
-			gr_get_frame_filename(frame, cache_filename,
-					      MAX_FILENAME_SIZE);
-			// We will create a symlink to the original file, and
-			// then copy the file to the temporary cache dir. We do
-			// this symlink trick mostly to be able to use cp for
-			// copying, and avoid escaping file name characters when
-			// calling system at the same time.
-			char tmp_filename_symlink[MAX_FILENAME_SIZE + 4] = {0};
-			strcat(tmp_filename_symlink, cache_filename);
-			strcat(tmp_filename_symlink, ".sym");
-			char command[MAX_FILENAME_SIZE + 256];
-			size_t len =
-				snprintf(command, MAX_FILENAME_SIZE + 255,
-					 "cp '%s' '%s'", tmp_filename_symlink,
-					 cache_filename);
-			if (len > MAX_FILENAME_SIZE + 255 ||
-			    symlink(original_filename, tmp_filename_symlink) ||
-			    system(command) != 0) {
-				gr_reporterror_cmd(cmd,
-						   "EBADF: could not copy the "
-						   "image to the cache dir");
-				fprintf(stderr,
-					"Could not copy the image "
-					"%s (symlink %s) to %s",
-					sanitized_filename(original_filename),
-					tmp_filename_symlink, cache_filename);
-				frame->status = STATUS_UPLOADING_ERROR;
-				frame->uploading_failure = ERROR_CANNOT_COPY_FILE;
-			} else {
-				// Get the file size of the copied file.
-				frame->status = STATUS_UPLOADING_SUCCESS;
-				frame->disk_size = st.st_size;
-				frame->image->total_disk_size += st.st_size;
-				images_disk_size += frame->disk_size;
-				if (frame->expected_size &&
-				    frame->expected_size != frame->disk_size) {
-					// The file has unexpected size.
-					frame->status = STATUS_UPLOADING_ERROR;
-					frame->uploading_failure =
-						ERROR_UNEXPECTED_SIZE;
-					gr_reportuploaderror(frame);
-				} else {
-					// Everything seems fine, try to load
-					// and redraw existing instances.
-					gr_schedule_image_redraw(frame->image);
-					frame = gr_loadimage_and_report(frame);
-				}
-			}
-			// Delete the symlink.
-			unlink(tmp_filename_symlink);
-			// Delete the original file if it's temporary.
-			if (cmd->transmission_medium == 't')
-				gr_delete_tmp_file(original_filename);
+		frame->original_filename = gr_base64dec(cmd->payload, NULL);
+		// Copy the file to the cache directory.
+		gr_copy_imagefile(frame, cmd);
+		if (frame->status == STATUS_UPLOADING_SUCCESS) {
+			// Everything seems fine, try to load and redraw
+			// existing instances.
+			gr_schedule_image_redraw(frame->image);
+			frame = gr_loadimage_and_report(frame);
 		}
-		free(original_filename);
+		// Delete the original file if it's temporary.
+		if (cmd->transmission_medium == 't')
+			gr_delete_tmp_file(frame->original_filename);
 		gr_check_limits();
 	} else if (cmd->transmission_medium == 'd') {
 		// Direct transmission (default if 't' is not specified).
 		frame = gr_get_last_frame(gr_find_image_for_command(cmd));
-		if (frame && frame->status == STATUS_UPLOADING) {
+		if (gr_transmission_continuation_is_allowed(cmd, frame)) {
 			// This is a continuation of the previous transmission.
 			cmd->is_direct_transmission_continuation = 1;
 			cmd->image_id = frame->image->image_id;
@@ -3389,10 +3708,7 @@ static ImageFrame *gr_handle_transmit_command(GraphicsCommand *cmd) {
 			gr_reportuploaderror(frame);
 		}
 		// Close the cache file.
-		if (frame->open_file) {
-			fclose(frame->open_file);
-			frame->open_file = NULL;
-		}
+		gr_close_disk_cache_file(frame);
 		// Unmap the data
 		if (munmap(data, size) != 0)
 			fprintf(stderr, "munmap failed: %s\n", strerror(errno));
@@ -3667,13 +3983,17 @@ static void gr_handle_command(GraphicsCommand *cmd) {
 		// response, so set quiet to 2.
 		cmd->quiet = 2;
 	}
+
+	int was_transmission = 0;
 	ImageFrame *frame = NULL;
+
 	switch (cmd->action) {
 	case 0:
 		// If no action is specified, it is data transmission.
 	case 't':
 	case 'q':
 	case 'f':
+		was_transmission = 1;
 		// Transmit data. 'q' means query, which is basically the same
 		// as transmit, but the image is discarded, and the id is fake.
 		// 'f' appends a frame to an existing image.
@@ -3684,6 +4004,7 @@ static void gr_handle_command(GraphicsCommand *cmd) {
 		gr_handle_put_command(cmd);
 		break;
 	case 'T':
+		was_transmission = 1;
 		// Transmit and display.
 		frame = gr_handle_transmit_command(cmd);
 		if (frame && !cmd->is_direct_transmission_continuation) {
@@ -3702,7 +4023,16 @@ static void gr_handle_command(GraphicsCommand *cmd) {
 	default:
 		gr_reporterror_cmd(cmd, "EINVAL: unsupported action: %c",
 				   cmd->action);
-		return;
+		break;
+	}
+
+	if (!was_transmission ||
+	    (cmd->transmission_medium && cmd->transmission_medium != 'd')) {
+		// If it wasn't a transmission command, or if the transmission
+		// wasn't direct, clear the current upload frame and close the
+		// file. (If it was a direct transmission, the current upload
+		// was handled inside `gr_append_data`.)
+		gr_set_current_upload_frame(NULL);
 	}
 }
 

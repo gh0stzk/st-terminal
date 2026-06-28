@@ -7,6 +7,7 @@ Xft.lcdfilter:	lcddefault
 
 st.font:        JetBrainsMono Nerd Font:style:regular:pixelsize=13
 st.borderpx:    15
+st.alpha:       1.0
 
 ! OneDark Colorscheme for Isabel Rice
 
