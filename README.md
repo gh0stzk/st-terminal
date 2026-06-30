@@ -12,6 +12,7 @@ Patches removed: Alpha, External pipe.
 - [Kitty graphics protocol](https://github.com/sergei-grechanik/st-graphics) - Images in your terminal, just like kitty, just like a modern terminal emulator.
 - [Boxdraw](https://st.suckless.org/patches/boxdraw)
 - [xresources with signal reloading](https://st.suckless.org/patches/xresources-with-reload-signal/) - Configure st via Xresources and signal reloading.
+- [Alpha](https://st.suckless.org/patches/alpha/) - allows users to change the opacity of the background.
 - [Scrollback](https://st.suckless.org/patches/scrollback)
 - [Wide glyph support](https://st.suckless.org/patches/glyph_wide_support/) - Fixes wide glyphs truncation
 - [Ligatures](https://st.suckless.org/patches/ligatures) - Proper drawing of ligatures.

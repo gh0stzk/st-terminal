@@ -283,6 +283,7 @@ static char *opt_io    = NULL;
 static char *opt_line  = NULL;
 static char *opt_name  = NULL;
 static char *opt_title = NULL;
+static int opt_alpha   = 0;
 
 static uint buttons; /* bit field of pressed buttons */
 static int cursorblinks = 0;
@@ -2859,7 +2860,8 @@ xrdb_load(void)
 
 		XRESOURCE_LOAD_FLOAT("cwscale", cwscale);
 		XRESOURCE_LOAD_FLOAT("chscale", chscale);
-        XRESOURCE_LOAD_FLOAT("alpha", alpha);
+        if (!opt_alpha)
+            XRESOURCE_LOAD_FLOAT("alpha", alpha);
 	}
 	XFlush(dpy);
 }
@@ -2911,9 +2913,10 @@ main(int argc, char *argv[])
 		allowaltscreen = 0;
 		break;
 	case 'A':
-		alpha = strtof(EARGF(usage()), NULL);
-		LIMIT(alpha, 0.0, 1.0);
-		break;
+        opt_alpha = 1;
+        alpha = strtof(EARGF(usage()), NULL);
+        LIMIT(alpha, 0.0, 1.0);
+        break;
 	case 'c':
 		opt_class = EARGF(usage());
 		break;
