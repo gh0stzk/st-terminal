@@ -24,6 +24,7 @@ Patches removed: Alpha, External pipe.
 - [Bold is not bright](https://st.suckless.org/patches/bold-is-not-bright/) - This patch makes bold text rendered simply as bold, leaving the color unaffected.
 - [swap mouse](https://st.suckless.org/patches/swapmouse/) - This patch changes the mouse shape to the global default when the running program subscribes for mouse events, for instance, in programs like ranger, yazi and fzf.
 - [Unfocused-cursor](https://st.suckless.org/patches/unfocused_cursor/) - Removes the outlined rectangle, making the cursor invisible when the window is unfocused.
+- [AnyGeometry](https://st.suckless.org/patches/anygeometry/) - This patch allows you to set st's width and height as pixels instead of cells
 
 ### Patches and changes that are included in the graphics implementation
 
